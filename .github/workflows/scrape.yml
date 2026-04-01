@@ -1,0 +1,47 @@
+name: Daily Amazon Scraper
+
+on:
+  schedule:
+    - cron: '30 4 * * *'   # 10:00 AM IST (UTC+5:30)
+  workflow_dispatch:        # Manual run button
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Cache Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-chromium-${{ runner.os }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: Run scraper
+        run: python scraper.py
+
+      - name: Commit results
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add amazon_data.csv
+          git diff --cached --quiet || git commit -m "📊 Updated: $(TZ='Asia/Kolkata' date +'%d-%b-%Y %I:%M %p IST')"
+          git push
