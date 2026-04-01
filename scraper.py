@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Amazon Scraper — GitHub Actions Edition
+Amazon Hybrid Scraper — GitHub Actions Edition
 Primary: requests + BeautifulSoup (fast)
 Fallback: Playwright headless Chromium (when blocked)
 """
@@ -23,10 +23,10 @@ OUTPUT_FILE  = "amazon_data.csv"
 FIELDS       = ["ASIN", "Product URL", "Title", "Price",
                 "Seller", "Buy Box Active", "Quantity"]
 
-BASE_DELAY   = 1.8
-JITTER       = 1.0
-BATCH_SIZE   = 25
-COOLDOWN     = 15
+BASE_DELAY   = 1.2       # was 1.8
+JITTER       = 0.5       # was 1.0
+BATCH_SIZE   = 35        # was 25
+COOLDOWN     = 10        # was 15
 PW_RECYCLE   = 50
 
 USER_AGENTS = [
@@ -40,7 +40,6 @@ USER_AGENTS = [
     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
 ]
 
-# JS executed inside Playwright page to extract product data
 EXTRACT_JS = r"""
 () => {
     function txt(el) {
@@ -192,13 +191,11 @@ def scrape_requests(asin, session):
 
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # Title
         tag = soup.find(id="productTitle")
         title = tag.get_text(strip=True) if tag else "Not Found"
         if title == "Not Found":
             return None
 
-        # Price — scan likely selectors, skip strikethrough
         price = "Not Found"
         for el in soup.select(
             "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen,"
@@ -214,7 +211,6 @@ def scrape_requests(asin, session):
                 price = p
                 break
 
-        # Seller
         seller = "Not Found"
         stag = soup.select_one("#sellerProfileTriggerId")
         if stag and stag.get_text(strip=True):
@@ -227,11 +223,9 @@ def scrape_requests(asin, session):
                 if t:
                     seller = t
 
-        # Buy Box
         buybox = ("Yes" if soup.select_one(
             "#add-to-cart-button, #buy-now-button") else "No")
 
-        # Quantity
         qty = "1"
         q = soup.select_one("#selectQuantity .a-dropdown-prompt")
         if q and q.get_text(strip=True).isdigit():
@@ -252,7 +246,6 @@ def scrape_requests(asin, session):
 
 # ══════════════════ PLAYWRIGHT SCRAPER ══════════════════
 
-# Module-level handles (created only when needed)
 _pw = _browser = _context = _page = None
 
 
@@ -275,7 +268,6 @@ def pw_new_context():
     _page.add_init_script(
         "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
     )
-    # Block heavy resources for speed
     _page.route(
         re.compile(r"\.(png|jpg|jpeg|gif|svg|ico|webp|css|woff2?|ttf)$"),
         lambda route: route.abort(),
@@ -315,11 +307,13 @@ def scrape_playwright(asin):
                 "#productTitle, .a-price .a-offscreen", timeout=10000
             )
             if looks_blocked(_page.content()[:3000]):
-                time.sleep(3)
+                time.sleep(4)
                 continue
 
             data = _page.evaluate(EXTRACT_JS)
             if not data or data.get("title") in (None, "", "Not Found"):
+                if attempt == 0:
+                    time.sleep(2)
                 continue
 
             return {
@@ -333,7 +327,7 @@ def scrape_playwright(asin):
         except Exception as e:
             print(f"\n  ⚠ PW error {asin} (attempt {attempt+1}): {e}")
             if attempt == 0:
-                time.sleep(2)
+                time.sleep(3)
     return None
 
 
@@ -358,11 +352,9 @@ def main():
 
     try:
         for i, asin in enumerate(asins, 1):
-            # ── Try requests first ──
             result = scrape_requests(asin, session)
             method = "REQ"
 
-            # ── Playwright fallback ──
             if not result:
                 if not pw_started:
                     print("\n  🌐 Starting Playwright browser...")
@@ -383,7 +375,6 @@ def main():
                     pw_recycle()
                     pw_uses = 0
 
-            # ── Fill empty on total failure ──
             if not result:
                 result = empty_result(asin)
                 method = "FAIL"
@@ -391,22 +382,21 @@ def main():
             results.append(result)
             stats[method] += 1
 
-            # ── Progress line ──
             pct = int(100 * i / total)
             price_s = result.get("Price", "N/A")[:14]
             elapsed = time.time() - start
-            eta = (elapsed / i) * (total - i)
+            rate = i / elapsed if elapsed > 0 else 0
+            eta = (total - i) / rate if rate > 0 else 0
+
             print(
                 f"\r  [{pct:3d}%] {i}/{total} | {method:4s} | "
                 f"{price_s:<14} | ETA {eta:.0f}s  ",
                 end="", flush=True,
             )
 
-            # ── Pacing ──
             if i < total:
                 time.sleep(BASE_DELAY + random.random() * JITTER)
 
-            # ── Batch cooldown ──
             if i % BATCH_SIZE == 0 and i < total:
                 print(f"\n  ⏳ Cooldown {COOLDOWN}s "
                       f"(batch {i // BATCH_SIZE})...")
@@ -417,7 +407,6 @@ def main():
     except Exception as e:
         print(f"\n\n❌ Error: {e}")
     finally:
-        # ── Always write whatever we have ──
         print(f"\n\n💾 Writing {len(results)} results to {OUTPUT_FILE}...")
         with open(OUTPUT_FILE, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=FIELDS)
@@ -427,7 +416,6 @@ def main():
         if pw_started:
             pw_stop()
 
-    # ── Summary ──
     elapsed_min = (time.time() - start) / 60
     done = sum(stats.values())
     print(f"\n{'═'*50}")
@@ -437,6 +425,14 @@ def main():
     print(f"  ❌ Failed:     {stats['FAIL']}")
     print(f"  📁 Output:     {OUTPUT_FILE}")
     print(f"{'═'*50}")
+
+    # Write summary file for email script to read
+    with open("run_summary.txt", "w") as f:
+        f.write(f"{done}\n")
+        f.write(f"{elapsed_min:.1f}\n")
+        f.write(f"{stats['REQ']}\n")
+        f.write(f"{stats['PW']}\n")
+        f.write(f"{stats['FAIL']}\n")
 
 
 if __name__ == "__main__":
