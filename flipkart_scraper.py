@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Flipkart Scraper — GitHub Actions Edition
-Multi-threaded, requests-only (no browser needed)
+Uses Playwright (headless browser) since Flipkart blocks raw requests.
+Sequential with delays to avoid detection.
 """
 
 import csv
@@ -10,22 +11,20 @@ import random
 import re
 import sys
 import time
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-import requests
 
 # ══════════════════ CONFIG ══════════════════
 
-INPUT_FILE   = "pids.csv"
-OUTPUT_FILE  = "flipkart_data.csv"
-BASE_URL     = "https://www.flipkart.com/product/p/itm?pid="
-MAX_WORKERS  = 4          # slightly lower than local to be safe
-TIMEOUT      = 30
-FIELDS       = ["PID", "Product URL", "Title", "Selling Price",
-                "Seller", "Seller Rating"]
+INPUT_FILE  = "pids.csv"
+OUTPUT_FILE = "flipkart_data.csv"
+BASE_URL    = "https://www.flipkart.com/product/p/itm?pid="
+FIELDS      = ["PID", "Product URL", "Title", "Selling Price",
+               "Seller", "Seller Rating"]
 
-print_lock = threading.Lock()
+BASE_DELAY  = 1.0
+JITTER      = 0.5
+BATCH_SIZE  = 40
+COOLDOWN    = 8
+RECYCLE     = 60
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -34,29 +33,98 @@ USER_AGENTS = [
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
 ]
 
-
-def get_headers():
-    return {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,"
-                  "application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
+EXTRACT_JS = r"""
+() => {
+    function txt(el) {
+        return el ? (el.innerText || el.textContent || '').trim() : '';
     }
 
+    // Title
+    let title = '';
+    for (const sel of ['span.VU-ZEz', 'span.B_NuCI', 'h1._9E25nV', 'h1.yhB1nd', 'h1']) {
+        let el = document.querySelector(sel);
+        if (el && txt(el)) { title = txt(el); break; }
+    }
+    if (!title) {
+        let meta = document.querySelector('meta[property="og:title"]');
+        if (meta) title = meta.getAttribute('content') || '';
+    }
+    title = title || 'N/A';
 
-def safe_print(*args):
-    with print_lock:
-        print(*args, flush=True)
+    // Price
+    let price = 'N/A';
+    let priceClasses = ['Nx9bqj.CxhGGd', 'Nx9bqj', 'CEmiEU', '_30jeq3._16Jk6d', '_30jeq3', 'hl05eU'];
+    for (const cls of priceClasses) {
+        let els = document.querySelectorAll('div.' + cls.replace(/\s+/g, '.'));
+        for (let el of els) {
+            let t = txt(el);
+            if (t.includes('₹')) {
+                let m = t.replace(/,/g, '').match(/₹\s*(\d+)/);
+                if (m) { price = '₹' + m[1]; break; }
+            }
+        }
+        if (price !== 'N/A') break;
+    }
+
+    // Fallback: JSON-LD
+    if (price === 'N/A') {
+        let scripts = document.querySelectorAll('script[type="application/ld+json"]');
+        for (let s of scripts) {
+            try {
+                let data = JSON.parse(s.textContent);
+                if (data.offers) {
+                    let o = Array.isArray(data.offers) ? data.offers[0] : data.offers;
+                    if (o && o.price) { price = '₹' + Math.round(o.price); break; }
+                }
+            } catch(e) {}
+        }
+    }
+
+    // Seller
+    let seller = 'N/A';
+    let sellerDiv = document.getElementById('sellerName');
+    if (sellerDiv) {
+        let span = sellerDiv.querySelector('span');
+        if (span) {
+            let t = txt(span).replace(/[\d.]+$/, '').trim();
+            if (t) seller = t;
+        }
+    }
+    if (seller === 'N/A') {
+        for (const cls of ['yeLeBC', '_1RLviY', 'wHxIto']) {
+            let el = document.querySelector('span.' + cls);
+            if (el) {
+                let t = txt(el).replace(/[\d.]+$/, '').trim();
+                if (t) { seller = t; break; }
+            }
+        }
+    }
+
+    // Seller Rating
+    let rating = 'N/A';
+    if (sellerDiv) {
+        let t = txt(sellerDiv);
+        let m = t.match(/(\d+\.?\d*)\s*$/);
+        if (m && parseFloat(m[1]) <= 5) rating = m[1];
+    }
+    if (rating === 'N/A') {
+        for (const cls of ['_1cPkYt', 'uA5CGE']) {
+            let el = document.querySelector('.' + cls);
+            if (el) {
+                let m = txt(el).match(/(\d+\.?\d*)/);
+                if (m && parseFloat(m[1]) <= 5) { rating = m[1]; break; }
+            }
+        }
+    }
+
+    return { title, price, seller, rating };
+}
+"""
 
 
-# ══════════════════ LOAD PIDs ══════════════════
+# ══════════════════ HELPERS ══════════════════
 
 def read_pids():
     pids = []
@@ -73,168 +141,89 @@ def read_pids():
         sys.exit(1)
 
 
-# ══════════════════ EXTRACTORS ══════════════════
-
-def extract_title(soup):
-    from bs4 import BeautifulSoup
-
-    title_selectors = [
-        ("span", {"class": "VU-ZEz"}),
-        ("span", {"class": "B_NuCI"}),
-        ("h1", {"class": "_9E25nV"}),
-        ("h1", {"class": "yhB1nd"}),
-    ]
-    for tag, attrs in title_selectors:
-        el = soup.find(tag, attrs)
-        if el:
-            return el.get_text(strip=True)
-
-    h1 = soup.find("h1")
-    if h1:
-        return h1.get_text(strip=True)
-
-    meta = soup.find("meta", {"property": "og:title"})
-    if meta and meta.get("content"):
-        return meta["content"]
-
-    return "N/A"
+def empty_result(pid):
+    return {
+        "PID": pid,
+        "Product URL": f"{BASE_URL}{pid}",
+        "Title": "FAILED TO FETCH",
+        "Selling Price": "N/A",
+        "Seller": "N/A",
+        "Seller Rating": "N/A",
+    }
 
 
-def clean_price(text):
-    if not text:
-        return "N/A"
-    text = re.sub(r"[a-zA-Z]+$", "", text)
-    m = re.search(r"₹\s*([\d,]+)", text)
-    if m:
-        return "₹" + m.group(1)
-    return "N/A"
+# ══════════════════ PLAYWRIGHT ══════════════════
+
+_pw = _browser = _context = _page = None
 
 
-def extract_price(soup, html_text):
-    # Method 1: class selectors
-    price_classes = [
-        "Nx9bqj CxhGGd", "Nx9bqj", "CEmiEU",
-        "_30jeq3 _16Jk6d", "_30jeq3", "hl05eU",
-    ]
-    for cls in price_classes:
-        for el in soup.find_all("div", class_=cls):
-            text = el.get_text(strip=True)
-            if "₹" in text:
-                p = clean_price(text)
-                if p != "N/A":
-                    return p
+def pw_start():
+    global _pw, _browser
+    from playwright.sync_api import sync_playwright
+    _pw = sync_playwright().start()
+    _browser = _pw.chromium.launch(headless=True)
+    pw_new_context()
 
-    # Method 2: regex class patterns
-    for pattern in ["Nx9bqj", "_30jeq3", "CEmiEU", "hl05eU"]:
-        for el in soup.find_all(class_=re.compile(pattern)):
-            text = el.get_text(strip=True)
-            if "₹" in text:
-                p = clean_price(text)
-                if p != "N/A":
-                    return p
 
-    # Method 3: JSON-LD
-    for script in soup.find_all("script", type="application/ld+json"):
+def pw_new_context():
+    global _context, _page
+    _context = _browser.new_context(
+        user_agent=random.choice(USER_AGENTS),
+        viewport={"width": 1920, "height": 1080},
+        locale="en-US",
+    )
+    _page = _context.new_page()
+    _page.add_init_script(
+        "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+    )
+    _page.route(
+        re.compile(r"\.(png|jpg|jpeg|gif|svg|ico|webp|woff2?|ttf)$"),
+        lambda route: route.abort(),
+    )
+
+
+def pw_recycle():
+    global _context, _page
+    try:
+        _page.close()
+    except Exception:
+        pass
+    try:
+        _context.close()
+    except Exception:
+        pass
+    pw_new_context()
+
+
+def pw_stop():
+    for obj in (_page, _context, _browser, _pw):
         try:
-            data = json.loads(script.string)
-            if isinstance(data, dict) and "offers" in data:
-                offers = data["offers"]
-                if isinstance(offers, dict) and "price" in offers:
-                    return "₹" + str(int(float(offers["price"])))
-                elif isinstance(offers, list) and offers:
-                    if "price" in offers[0]:
-                        return "₹" + str(int(float(offers[0]["price"])))
+            if hasattr(obj, "close"):
+                obj.close()
+            elif hasattr(obj, "stop"):
+                obj.stop()
         except Exception:
             pass
 
-    # Method 4: regex in raw HTML
-    m = re.search(r'"price"\s*:\s*["\']?(\d+(?:\.\d+)?)["\']?', html_text)
-    if m:
-        return "₹" + str(int(float(m.group(1))))
-
-    return "N/A"
-
-
-def extract_seller(soup):
-    # Method 1: seller div ID
-    seller_div = soup.find("div", {"id": "sellerName"})
-    if seller_div:
-        span = seller_div.find("span")
-        if span:
-            text = span.get_text(strip=True)
-            clean = re.sub(r"[\d.]+$", "", text).strip()
-            if clean:
-                return clean
-
-    # Method 2: seller classes
-    for cls in ["yeLeBC", "_1RLviY", "wHxIto"]:
-        el = soup.find("span", class_=cls)
-        if el:
-            text = el.get_text(strip=True)
-            clean = re.sub(r"[\d.]+$", "", text).strip()
-            if clean:
-                return clean
-
-    # Method 3: seller section
-    section = soup.find("div", id=re.compile("seller", re.I))
-    if section:
-        for span in section.find_all("span"):
-            text = span.get_text(strip=True)
-            if text and len(text) > 2 and not text.isdigit():
-                clean = re.sub(r"[\d.]+$", "", text).strip()
-                if clean:
-                    return clean
-
-    return "N/A"
-
-
-def extract_seller_rating(soup):
-    # Method 1: from seller div
-    seller_div = soup.find("div", {"id": "sellerName"})
-    if seller_div:
-        text = seller_div.get_text(strip=True)
-        m = re.search(r"(\d+\.?\d*)\s*$", text)
-        if m:
-            r = float(m.group(1))
-            if 0 < r <= 5:
-                return str(r)
-
-    # Method 2: rating classes
-    for cls in ["_1cPkYt", "uA5CGE"]:
-        el = soup.find(class_=cls)
-        if el:
-            text = el.get_text(strip=True)
-            m = re.search(r"(\d+\.?\d*)", text)
-            if m:
-                r = float(m.group(1))
-                if 0 < r <= 5:
-                    return str(r)
-
-    return "N/A"
-
-
-# ══════════════════ SCRAPE ONE ══════════════════
 
 def scrape_product(pid, index, total):
     url = f"{BASE_URL}{pid}"
-    session = requests.Session()
 
-    for attempt in range(3):
+    for attempt in range(2):
         try:
-            time.sleep(random.uniform(0.5, 1.5))
+            _page.goto(url, wait_until="domcontentloaded", timeout=20000)
 
-            r = session.get(url, headers=get_headers(), timeout=TIMEOUT)
-            r.raise_for_status()
+            # Wait for title or price to appear
+            _page.wait_for_selector(
+                "span.VU-ZEz, span.B_NuCI, h1, div.Nx9bqj, div._30jeq3",
+                timeout=10000,
+            )
 
-            html = r.text
-
-            # Import here to avoid issues at module level
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(r.content, "html.parser")
-
-            # Not found check
-            if "Sorry, no results found" in html or "Page Not Found" in html:
-                safe_print(f"  [{index}/{total}] ✗ {pid} — NOT FOUND")
+            # Check not found
+            content = _page.content()[:3000]
+            if "Sorry, no results found" in content or "Page Not Found" in content:
+                print(f"\r  [{index}/{total}] ✗ {pid} — NOT FOUND",
+                      flush=True)
                 return {
                     "PID": pid, "Product URL": url,
                     "Title": "PRODUCT NOT FOUND",
@@ -242,47 +231,39 @@ def scrape_product(pid, index, total):
                     "Seller": "N/A", "Seller Rating": "N/A",
                 }
 
-            title = extract_title(soup)
-            price = extract_price(soup, html)
-            seller = extract_seller(soup)
-            rating = extract_seller_rating(soup)
+            data = _page.evaluate(EXTRACT_JS)
+            if not data:
+                continue
 
             result = {
                 "PID": pid,
-                "Product URL": str(r.url),
-                "Title": title,
-                "Selling Price": price,
-                "Seller": seller,
-                "Seller Rating": rating,
+                "Product URL": _page.url,
+                "Title": data.get("title", "N/A"),
+                "Selling Price": data.get("price", "N/A"),
+                "Seller": data.get("seller", "N/A"),
+                "Seller Rating": data.get("rating", "N/A"),
             }
 
-            icon = "✓" if price != "N/A" else "⚠"
-            safe_print(
-                f"  [{index}/{total}] {icon} {pid} | "
-                f"{price} | {seller} | {title[:35]}..."
+            icon = "✓" if result["Selling Price"] != "N/A" else "⚠"
+            price_s = result["Selling Price"][:12]
+            title_s = result["Title"][:30]
+            print(
+                f"\r  [{index}/{total}] {icon} {pid} | "
+                f"{price_s:<12} | {title_s}...",
+                flush=True,
             )
             return result
 
-        except requests.exceptions.HTTPError as e:
-            if attempt == 2:
-                safe_print(f"  [{index}/{total}] ✗ {pid} — HTTP {e}")
-        except requests.exceptions.ConnectionError:
-            if attempt == 2:
-                safe_print(f"  [{index}/{total}] ✗ {pid} — Connection Error")
-            time.sleep(2)
         except Exception as e:
-            if attempt == 2:
-                safe_print(
-                    f"  [{index}/{total}] ✗ {pid} — {str(e)[:50]}"
+            if attempt == 0:
+                time.sleep(2)
+            else:
+                print(
+                    f"\r  [{index}/{total}] ✗ {pid} — {str(e)[:50]}",
+                    flush=True,
                 )
 
-        time.sleep(attempt + 1)
-
-    return {
-        "PID": pid, "Product URL": url,
-        "Title": "FAILED TO FETCH", "Selling Price": "N/A",
-        "Seller": "N/A", "Seller Rating": "N/A",
-    }
+    return empty_result(pid)
 
 
 # ══════════════════ MAIN ══════════════════
@@ -294,28 +275,49 @@ def main():
         return
 
     total = len(pids)
-    print(f"🚀 Scraping {total} Flipkart products "
-          f"({MAX_WORKERS} workers)...\n")
+    print(f"🚀 Scraping {total} Flipkart products...\n")
 
-    start = time.time()
+    pw_start()
+
+    # Warmup
+    print("  🔥 Warming up browser...")
+    try:
+        _page.goto("https://www.flipkart.com/", timeout=15000)
+        time.sleep(2)
+    except Exception:
+        pass
+    print("  ✅ Ready!\n")
+
     results = []
+    pw_uses = 0
+    start = time.time()
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(scrape_product, pid, i, total): pid
-            for i, pid in enumerate(pids, 1)
-        }
-        for future in as_completed(futures):
-            try:
-                results.append(future.result())
-            except Exception as e:
-                safe_print(f"  ❌ Thread error: {e}")
+    try:
+        for i, pid in enumerate(pids, 1):
+            result = scrape_product(pid, i, total)
+            results.append(result)
+            pw_uses += 1
 
-    # Sort results back to original PID order
-    pid_order = {pid: i for i, pid in enumerate(pids)}
-    results.sort(key=lambda r: pid_order.get(r["PID"], 999999))
+            if pw_uses >= RECYCLE:
+                print(f"\n  🔄 Recycling browser context...")
+                pw_recycle()
+                pw_uses = 0
 
-    # Save CSV
+            if i < total:
+                time.sleep(BASE_DELAY + random.random() * JITTER)
+
+            if i % BATCH_SIZE == 0 and i < total:
+                print(f"\n  ⏳ Cooldown {COOLDOWN}s (batch {i // BATCH_SIZE})...")
+                time.sleep(COOLDOWN)
+
+    except KeyboardInterrupt:
+        print("\n🛑 Interrupted!")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+    finally:
+        pw_stop()
+
+    # Save
     print(f"\n💾 Writing {len(results)} results to {OUTPUT_FILE}...")
     with open(OUTPUT_FILE, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=FIELDS)
@@ -324,18 +326,16 @@ def main():
 
     # Stats
     elapsed = time.time() - start
+    elapsed_min = elapsed / 60
     success = sum(1 for r in results if r["Selling Price"] != "N/A")
 
     print(f"\n{'═'*50}")
-    print(f"  ✅ Done: {total} products in {elapsed:.1f}s")
+    print(f"  ✅ Done: {total} products in {elapsed_min:.1f} min")
     print(f"  💰 Price found:   {success} ({success/total*100:.1f}%)")
     print(f"  ❌ Price missing: {total - success}")
-    print(f"  ⚡ Speed:         {total/elapsed:.1f} products/sec")
     print(f"  📁 Output:        {OUTPUT_FILE}")
     print(f"{'═'*50}")
 
-    # Write summary for email
-    elapsed_min = elapsed / 60
     with open("run_summary.txt", "w") as f:
         f.write(f"{total}\n")
         f.write(f"{elapsed_min:.1f}\n")
