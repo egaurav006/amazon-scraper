@@ -1,1 +1,49 @@
+name: Daily Flipkart Scraper
 
+on:
+  schedule:
+    - cron: '0 5 * * *'    # 10:30 AM IST (30 min after Amazon)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Run Flipkart scraper
+        run: python flipkart_scraper.py
+
+      - name: Send email report
+        if: always()
+        env:
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+        run: |
+          sed -i 's/amazon_data.csv/flipkart_data.csv/g' email_report.py
+          sed -i 's/Amazon Scraper/Flipkart Scraper/g' email_report.py
+          python email_report.py
+
+      - name: Commit results
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add flipkart_data.csv
+          git diff --cached --quiet || git commit -m "🛍️ Flipkart Updated: $(TZ='Asia/Kolkata' date +'%d-%b-%Y %I:%M %p IST')"
+          git push
