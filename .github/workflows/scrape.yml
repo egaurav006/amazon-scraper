@@ -2,8 +2,8 @@ name: Daily Amazon Scraper
 
 on:
   schedule:
-    - cron: '30 4 * * *'   # 10:00 AM IST (UTC+5:30)
-  workflow_dispatch:        # Manual run button
+    - cron: '30 4 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -23,7 +23,7 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Cache Playwright browser
+      - name: Cache Playwright
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
@@ -36,6 +36,13 @@ jobs:
 
       - name: Run scraper
         run: python scraper.py
+
+      - name: Send email report
+        if: always()
+        env:
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+        run: python email_report.py
 
       - name: Commit results
         if: always()
