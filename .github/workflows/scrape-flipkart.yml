@@ -2,7 +2,7 @@ name: Daily Flipkart Scraper
 
 on:
   schedule:
-    - cron: '0 5 * * *'    # 10:30 AM IST (30 min after Amazon)
+    - cron: '0 5 * * *'
   workflow_dispatch:
 
 permissions:
@@ -35,9 +35,11 @@ jobs:
           EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
         run: |
-          sed -i 's/amazon_data.csv/flipkart_data.csv/g' email_report.py
-          sed -i 's/Amazon Scraper/Flipkart Scraper/g' email_report.py
-          python email_report.py
+          cp email_report.py email_flipkart.py
+          sed -i 's/amazon_data.csv/flipkart_data.csv/g' email_flipkart.py
+          sed -i 's/Amazon Scraper/Flipkart Scraper/g' email_flipkart.py
+          sed -i 's/amazon_data_/flipkart_data_/g' email_flipkart.py
+          python email_flipkart.py
 
       - name: Commit results
         if: always()
@@ -45,5 +47,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add flipkart_data.csv
-          git diff --cached --quiet || git commit -m "🛍️ Flipkart Updated: $(TZ='Asia/Kolkata' date +'%d-%b-%Y %I:%M %p IST')"
+          git diff --cached --quiet || git commit -m "🛍️ Flipkart: $(TZ='Asia/Kolkata' date +'%d-%b-%Y %I:%M %p IST')"
           git push
