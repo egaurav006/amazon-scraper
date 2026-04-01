@@ -23,10 +23,10 @@ OUTPUT_FILE  = "amazon_data.csv"
 FIELDS       = ["ASIN", "Product URL", "Title", "Price",
                 "Seller", "Buy Box Active", "Quantity"]
 
-BASE_DELAY   = 1.2       # was 1.8
-JITTER       = 0.5       # was 1.0
-BATCH_SIZE   = 35        # was 25
-COOLDOWN     = 10        # was 15
+BASE_DELAY   = 1.2
+JITTER       = 0.5
+BATCH_SIZE   = 35
+COOLDOWN     = 10
 PW_RECYCLE   = 50
 
 USER_AGENTS = [
@@ -151,12 +151,16 @@ def empty_result(asin):
 
 def create_session():
     s = requests.Session()
+    ua = random.choice(USER_AGENTS)
     s.headers.update({
-        "User-Agent": random.choice(USER_AGENTS),
+        "User-Agent": ua,
         "Accept": "text/html,application/xhtml+xml,"
                   "application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
         "Upgrade-Insecure-Requests": "1",
+        "Connection": "keep-alive",
+        "Cache-Control": "max-age=0",
     })
     retry = Retry(
         total=3, backoff_factor=1.0,
@@ -167,6 +171,24 @@ def create_session():
     s.mount("https://", adapter)
     s.mount("http://", adapter)
     return s
+
+
+def warmup_session(session):
+    """Visit Amazon homepage to get cookies before scraping."""
+    warmup_urls = [
+        "https://www.amazon.in/",
+        "https://www.amazon.in/gp/bestsellers/",
+    ]
+    for url in warmup_urls:
+        try:
+            session.headers["User-Agent"] = random.choice(USER_AGENTS)
+            r = session.get(url, timeout=10)
+            print(f"  🔥 Warmup {url[:40]}... HTTP {r.status_code}")
+            time.sleep(1)
+        except Exception as e:
+            print(f"  ⚠ Warmup failed: {e}")
+    # small pause after warmup
+    time.sleep(2)
 
 
 def _is_strike(el):
@@ -343,6 +365,12 @@ def main():
         return
 
     session = create_session()
+
+    # ── Warm up session (get cookies from Amazon) ──
+    print("\n🔥 Warming up session...")
+    warmup_session(session)
+    print("✅ Session ready!\n")
+
     pw_started = False
     pw_uses = 0
 
@@ -426,7 +454,6 @@ def main():
     print(f"  📁 Output:     {OUTPUT_FILE}")
     print(f"{'═'*50}")
 
-    # Write summary file for email script to read
     with open("run_summary.txt", "w") as f:
         f.write(f"{done}\n")
         f.write(f"{elapsed_min:.1f}\n")
