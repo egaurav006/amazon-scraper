@@ -1,0 +1,32 @@
+name: Test Email Only
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-email:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Create fake summary
+        run: |
+          echo "247" > run_summary.txt
+          echo "15.0" >> run_summary.txt
+          echo "211" >> run_summary.txt
+          echo "36" >> run_summary.txt
+          echo "0" >> run_summary.txt
+
+      - name: Send test email
+        env:
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+        run: python email_report.py
